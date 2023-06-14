@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="757218ab-467c-43a4-aa51-e3efc8462d91" name="pumpapp.local">
+        <fileTransfer rootFolder="/home/jassmith/app" accessType="SFTP" host="pumpapp.local" port="22" sshConfigId="9c256537-eb38-4e69-82c8-0b116ee794e9" sshConfig="jassmith@pumpapp.local:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
