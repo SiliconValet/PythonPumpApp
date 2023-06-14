@@ -42,7 +42,7 @@ class AppState:
     comm = None
 
     def __init__(self):
-        self.version = "1.0"
+        self.version = "1.1.0"
         self.last_step_timestamp_ms = -1
         """The last time the stepper motor performed a step (ms since epoch)."""
         self.scale_multiplier = 1.0
