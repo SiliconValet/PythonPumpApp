@@ -1,12 +1,19 @@
 import socket
 import select
 import board
-import stepper
+# import pigpio
+
+# import stepper
 import time
 import adafruit_mprls
 import threading
 import queue
 
+import advpistepper
+
+# @TODO: Remove debugging test code.
+# import RaspberryPiStepperDriver.accelstepper as accelstepper
+# import RaspberryPiStepperDriver.profiles as acceleration_profiles
 
 class AppState:
     runMotors = False
@@ -33,6 +40,8 @@ class AppState:
     """The queue of pressure sensor updates to send to the client."""
     last_priming_update = 0
 
+    home_offset = 0
+    """The offset from the stepper lib's home position in steps based on csv provided."""
     data_time_step_ms = 10
     """The time in milliseconds between movement data points."""
 
@@ -54,10 +63,36 @@ class AppState:
         self.app_start_time_ms = time.time() * 1000
         self.last_update = -1
         """The last time the stepper motor target position was updated (ms since epoch)."""
-        self.stepper = stepper.MyStepperController(
-            step_pin=23,
-            direction_pin=24,
-            enable_pin=25)
+        self.home_offset = 0
+        # self.stepper = stepper.MyStepperController(
+        #     step_pin=23,
+        #     direction_pin=24,
+        #     enable_pin=25)
+        self.step_pin = 23
+        """The GPIO pin number for the step pin."""
+        self.direction_pin = 24
+        """The GPIO pin number for the direction pin."""
+
+        # Set some params for the stepper driver
+        p = {
+            advpistepper.MAX_SPEED: 8000.0,
+            advpistepper.MAX_TORQUE_SPEED: 100.0,
+            advpistepper.ACCELERATION_RATE: 5000,
+            advpistepper.DECELERATION_RATE: 5000,
+            advpistepper.FULL_STEPS_PER_REV: 400,
+            advpistepper.STEP_PULSE_LENGTH: 10,
+            advpistepper.STEP_PULSE_DELAY: 10,
+        }
+
+        self.driver = advpistepper.DriverStepDirGeneric(
+            step_pin=self.step_pin,
+            dir_pin=self.direction_pin,
+            parameters=p)
+        self.stepper = advpistepper.AdvPiStepper(self.driver)
+
+        print(self.stepper.parameters)
+
+        #self.pi = pigpio.pi()
 
         i2c = board.I2C()
         # Connect to default over I2C
@@ -200,7 +235,8 @@ def set_new_home_position():
     """Set the current position as the new home position.
     This will reset the positional data index to 0.
     """
-    app.stepper.set_current_position(0)
+    # app.stepper.set_current_position(0)
+    app.stepper.zero()
     if app.debugging:
         logger("I:New home position set.")
 
@@ -231,7 +267,10 @@ def load_positional_data(line_count: int):
                 #     logger("E:Data error, expected:" + str(line_count) + " got:" + str(len(app.positional_data)))
                 # Set the "home" to whatever the first entry in the datafile is.
                 # This will avoid the stepper logic trying to "catch up" to start.
-                app.stepper.set_current_position(app.positional_data[0])
+                app.home_offset = app.positional_data[0]
+
+                # app.stepper.set_current_position(app.positional_data[0])
+                app.stepper.zero()
                 if app.debugging:
                     # Print the data if debugging is enabled.
                     for line in app.positional_data:
@@ -249,7 +288,11 @@ def update_priming(data: int):
     """
 
     # Set the priming speed. Note the negative assignment, this is a UX change.
-    app.priming_speed = -data
+    app.priming_speed = -data * app.scale_multiplier
+    app.stepper.run(
+        direction=1 if app.priming_speed > 0 else -1,
+        speed=abs(app.priming_speed))
+    # app.stepper.target_speed = app.priming_speed
     if app.debugging:
         logger("I:Priming speed updated to " + str(data) + " steps per second.")
 
@@ -296,19 +339,20 @@ def process_input(line):
     # (P)rime pump
     elif cmd == 'P':
         app.priming = True
-        app.stepper.enable_outputs()
+        # app.stepper.enable_outputs()
         # Convert the numeric bit to an integer.
         update_priming(int(data))
     # (R)un application.
     elif cmd == 'R':
         app.runMotors = True
-        app.stepper.enable_outputs()
+        # app.stepper.enable_outputs()
         logger("I:Application started")
     # (S)top application.
     elif cmd == 'S':
         app.runMotors = False
         app.priming = False
-        app.stepper.disable_outputs()
+        app.stepper.stop()
+        # app.stepper.disable_outputs()
         logger("I:Application stopped")
     # Update (V)elocity.
     elif cmd == 'V':
@@ -351,12 +395,34 @@ def update_target_position():
         # If we have waited long enough, update the target position.
         if (current_time_ms - app.last_update) > app.data_time_step_ms:
             # Update the target position.
-            app.stepper_target_position = round(app.positional_data[app.positional_data_index] * app.scale_multiplier)
+            raw_target_position = app.positional_data[app.positional_data_index] - app.home_offset
+            app.stepper_target_position = round(raw_target_position * app.scale_multiplier)
+
+            # Calculate the velocity.
+            speed = abs((app.stepper_target_position - app.stepper.current_position) / (app.data_time_step_ms / 1000))
+
+            if speed > 1:
+                # Update the stepper motor target position.
+                try:
+                    app.stepper.move_to(
+                        position=app.stepper_target_position,
+                        speed=speed * app.scale_multiplier)
+                except EOFError:
+                    logger("E:pigpio disconnected.")
+
+            else:
+                logger("I: v= "
+                       # + str(vel)
+                       # + " dX = "
+                       # + str(app.stepper_target_position - app.stepper.current_position)
+                       # + " dT "
+                       # + str(app.data_time_step_ms)
+                       + " Velocity too low, not moving.")
 
             # If debugging is enabled, print debugging information.
             if app.debugging:
                 logger("I:" + str(current_time_ms) + "," +
-                       str(app.stepper.current_position()) + "," +
+                       str(app.stepper.current_position) + "," +
                        str(app.stepper_target_position) + "," +
                        str(app.positional_data[app.positional_data_index] * app.scale_multiplier))
 
@@ -365,7 +431,7 @@ def update_target_position():
             # If we have reached the end of the data, stop the motors.
             if app.positional_data_index >= len(app.positional_data):
                 app.positional_data_index = 0
-                print("I:" + str(current_time_ms) + " Iteration complete.")
+                print("I:" + str(current_time_ms) + " Iteration complete. =--=-=-=-=-=-=-=-=-=-=--=")
 
             app.last_update = current_time_ms
 
@@ -373,36 +439,39 @@ def update_target_position():
 def update_stepper_movement():
     """Update the stepper motor movement.
     This will update the stepper motor movement based on the current target position and current position."""
-
+    print("This shouldn't be getting called anymore...")
+    return
     # Issue a step on the motor if the move_to target and current_position suggests it should.
-    if app.stepper_target_position != app.stepper.current_position():
-        # Calculate the delta between the target position and the current position.
-        delta_y = app.stepper_target_position - app.stepper.current_position()
-        # Calculate the delta in milliseconds since the last step.
-        delta_px = (current_time_in_ms()) - app.last_step_timestamp_ms
-        # Calculate the number of steps needed to reach target.
-        delta_y_t = round((delta_y * delta_px) / app.data_time_step_ms)
-        # If the delta is not 0, issue a step.
-        if delta_y_t != 0:
-            app.stepper.step(delta_y_t > 0)
-            app.last_step_timestamp_ms = current_time_in_ms()
+    # if app.stepper_target_position != app.stepper.current_position():
+    #     # Calculate the delta between the target position and the current position.
+    #     delta_y = app.stepper_target_position - app.stepper.current_position()
+    #     # Calculate the delta in milliseconds since the last step.
+    #     delta_px = (current_time_in_ms()) - app.last_step_timestamp_ms
+    #     # Calculate the number of steps needed to reach target.
+    #     delta_y_t = round((delta_y * delta_px) / app.data_time_step_ms)
+    #     # If the delta is not 0, issue a step.
+    #     if delta_y_t != 0:
+    #         app.stepper.step(delta_y_t > 0)
+    #         app.last_step_timestamp_ms = current_time_in_ms()
 
 
 def update_priming_position():
-    percent_of_steps_to_take = int(round(abs(app.priming_speed)))
-
-    # If we have waited long enough, update the target position.
-    if (current_time_in_ms() - app.last_priming_update) > 0.05:
-        app.last_priming_update = current_time_in_ms()
-
-        app.priming_iterations_since_last_update += 1
-
-        if app.priming_iterations_since_last_update > (100 - percent_of_steps_to_take):
-            app.priming_iterations_since_last_update = 0
-            if app.priming_speed > 0:
-                app.stepper.step(True)
-            elif app.priming_speed < 0:
-                app.stepper.step(False)
+    return
+    #
+    # percent_of_steps_to_take = int(round(abs(app.priming_speed)))
+    #
+    # # If we have waited long enough, update the target position.
+    # if (current_time_in_ms() - app.last_priming_update) > 0.05:
+    #     app.last_priming_update = current_time_in_ms()
+    #
+    #     app.priming_iterations_since_last_update += 1
+    #
+    #     if app.priming_iterations_since_last_update > (100 - percent_of_steps_to_take):
+    #         app.priming_iterations_since_last_update = 0
+    #         if app.priming_speed > 0:
+    #             app.stepper.step(True)
+    #         elif app.priming_speed < 0:
+    #             app.stepper.step(False)
 
 
 def main_loop_cycle():
@@ -420,7 +489,7 @@ def main_loop_cycle():
     # Update runtime state and feedback.
     if app.runMotors:
         update_target_position()
-        update_stepper_movement()
+        #update_stepper_movement()
 
     if app.priming:
         update_priming_position()
